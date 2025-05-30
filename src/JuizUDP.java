@@ -9,18 +9,20 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.BrokenBarrierException; // Import necessário para tratar a barreira
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.Semaphore;
 import java.util.Comparator; // Para ordenar a lista de jogadores
 
 // Classe que representa um Jogador no SERVIDOR (Juiz)
-// Teremos que criar essa classe, mas por enquanto, vamos usar uma versão simples
+// O servidor mantém uma instância desta classe para cada jogador conectado,
+// armazenando seu estado (nickname, IP, porta, pontuação, número escolhido na rodada).
 class Jogador {
-    String nickname;
-    InetAddress ip;
-    int porta;
-    int pontuacao = 0; // Começa com 0 pontos
-    int valorEscolhido = -1; // Número que o jogador escolhe em uma rodada
+    String nickname;      // Nome do jogador
+    InetAddress ip;       // Endereço IP do jogador
+    int porta;            // Porta UDP do jogador
+    int pontuacao = 0;    // Pontuação atual do jogador (começa em 0)
+    int valorEscolhido = -1; // Número que o jogador escolhe em uma rodada (-1 indica que ainda não escolheu)
 
     public Jogador(String nickname, InetAddress ip, int porta) {
         this.nickname = nickname;
@@ -29,87 +31,123 @@ class Jogador {
         this.pontuacao = 0; // Inicializa pontuação em 0
     }
 
-    // Métodos para enviar mensagens de volta para este jogador
+    // Método para enviar uma mensagem de volta para este jogador específico.
+    // Recebe o DatagramSocket do servidor para poder enviar o pacote.
     public void enviarMensagem(DatagramSocket serverSocket, String mensagem) throws IOException {
-        byte[] dados = mensagem.getBytes();
+        byte[] dados = mensagem.getBytes(); // Converte a mensagem de String para bytes
+        // Cria um DatagramPacket com os dados, tamanho, endereço IP e porta do jogador
         DatagramPacket pacoteResposta = new DatagramPacket(dados, dados.length, this.ip, this.porta);
-        serverSocket.send(pacoteResposta);
+        serverSocket.send(pacoteResposta); // Envia o pacote UDP
     }
 }
 
 
 public class JuizUDP {
 
-    // Lista de jogadores conectados. Usaremos um HashMap para facilitar o acesso pelo nickname ou IP/Porta
-    // A chave pode ser uma combinação de IP + Porta para identificar unicamente o jogador
-    // Ou, para simplificar por enquanto, o nickname, mas teremos que gerenciar nicknames duplicados.
-    // Vamos usar o nickname como chave para facilitar o acesso no momento.
+    // Mapa que armazena todos os jogadores conectados. A chave é o nickname do jogador.
+    // Usamos static para que seja acessível de qualquer lugar na classe e persista durante a execução do servidor.
     private static Map<String, Jogador> jogadoresConectados = new HashMap<>();
 
-    // A porta que o servidor UDP vai escutar
-    private static final int PORTA_SERVIDOR = 3000; // Conforme os PDFs 
+    // A porta que o servidor UDP vai escutar por mensagens dos clientes.
+    private static final int PORTA_SERVIDOR = 3000; // Conforme os PDFs e exemplos.
 
-    // Variáveis para a lógica do jogo (adaptadas do código TCP)
-    public static int N_JOGADORES_INICIAIS = 3; // O jogo começa com 3 jogadores 
-    public static Semaphore semaforoCadastro = new Semaphore(N_JOGADORES_INICIAIS); // Para limitar o número de jogadores
-    public static CyclicBarrier barreiraRodada; // Para sincronizar os jogadores em cada rodada
+    // Número de jogadores necessários para o jogo começar e para as rodadas terem as regras iniciais.
+    public static int N_JOGADORES_INICIAIS = 3;
 
-    // Método para inicializar/reconfigurar a barreira
+    // Semáforo para controlar o número de jogadores que podem se cadastrar.
+    // Garante que apenas N_JOGADORES_INICIAIS jogadores possam iniciar uma partida.
+    public static Semaphore semaforoCadastro = new Semaphore(N_JOGADORES_INICIAIS);
+
+    // Barreira para sincronizar os jogadores a cada rodada.
+    // Quando todos os jogadores de uma rodada "chegam" na barreira, a ação definida é executada.
+    public static CyclicBarrier barreiraRodada;
+
+    // Referência ao socket do servidor, para que possa ser usada na ação da barreira e em processarRodada.
+    // Torna-o static para ser acessível de dentro do Runnable da barreira.
+    private static DatagramSocket servidorSocketGlobal;
+
+
+    // Método para inicializar ou reconfigurar a barreira de sincronização das rodadas.
     public static void configurarBarreira() {
-        // A ação a ser executada quando a barreira é quebrada (todos os jogadores jogaram)
+        // Ação que será executada quando todos os jogadores chegarem à barreira.
         Runnable acaoBarreira = () -> {
             System.out.println("DEBUG: Barreira quebrada. Processando rodada...");
             try {
-                processarRodada();
-                // A barreira será configurada novamente após a rodada, se necessário.
+                // Chama o método que processa a lógica da rodada, passando o socket do servidor.
+                // O servidorSocketGlobal foi criado para ser acessível aqui.
+                processarRodada(servidorSocketGlobal);
             } catch (IOException e) {
                 System.err.println("Erro ao processar rodada após barreira: " + e.getMessage());
             }
         };
-        // O número de partes para a barreira é o número de jogadores ativos
-        barreiraRodada = new CyclicBarrier(jogadoresConectados.size(), acaoBarreira);
-        System.out.println("DEBUG: Barreira configurada para " + jogadoresConectados.size() + " jogadores.");
+
+        // Verifica se há jogadores ativos antes de configurar a barreira.
+        // A barreira precisa de pelo menos 1 parte para ser criada, mas para o jogo, precisamos de 2 ou 3.
+        if (jogadoresConectados.size() > 0) {
+            barreiraRodada = new CyclicBarrier(jogadoresConectados.size(), acaoBarreira);
+            System.out.println("DEBUG: Barreira configurada para " + jogadoresConectados.size() + " jogadores.");
+        } else {
+            // Se não há jogadores, a barreira não é necessária e é setada para null.
+            barreiraRodada = null;
+            System.out.println("DEBUG: Nenhuma barreira configurada, nenhum jogador ativo.");
+        }
     }
 
 
     public static void main(String[] args) {
-        DatagramSocket serverSocket = null; // Nosso "correio" UDP para o servidor
+        // O DatagramSocket principal do servidor.
+        // Declarado AQUI (fora do try) e inicializado como null para ser acessível no bloco 'finally'.
+        DatagramSocket serverSocket = null; 
 
         try {
-            serverSocket = new DatagramSocket(PORTA_SERVIDOR); // Abre a caixa de correio na porta 3000
+            // Tenta abrir o socket do servidor na porta definida.
+            serverSocket = new DatagramSocket(PORTA_SERVIDOR);
+            // Atribui o socket local à variável global para que a ação da barreira possa acessá-lo.
+            servidorSocketGlobal = serverSocket;
+
             System.out.println("Servidor do Jogo da Sobrevivência Numérica iniciado na porta " + PORTA_SERVIDOR);
             System.out.println("Aguardando jogadores...");
 
-            byte[] bufferRecebimento = new byte[1024]; // Buffer para armazenar os dados recebidos
+            // Buffer para armazenar os dados de cada pacote UDP recebido.
+            byte[] bufferRecebimento = new byte[1024];
 
-            while (true) { // Loop infinito para o servidor ficar escutando
+            // Loop infinito para o servidor continuar escutando por mensagens.
+            while (true) {
+                // Cria um DatagramPacket vazio para receber os dados.
                 DatagramPacket pacoteRecebido = new DatagramPacket(bufferRecebimento, bufferRecebimento.length);
-                serverSocket.receive(pacoteRecebido); // Servidor espera por um "cartão postal" 
+                // O servidor fica bloqueado aqui, esperando receber um pacote.
+                serverSocket.receive(pacoteRecebido);
 
-                // Extrai as informações do remetente
+                // Extrai o endereço IP e a porta do remetente do pacote.
                 InetAddress enderecoCliente = pacoteRecebido.getAddress();
                 int portaCliente = pacoteRecebido.getPort();
+                // Converte os dados do pacote para String, removendo espaços em branco extras.
                 String mensagemRecebida = new String(pacoteRecebido.getData(), 0, pacoteRecebido.getLength()).trim();
 
-                System.out.println("DEBUG: Mensagem recebida de " + enderecoCliente + ":" + portaCliente + " -> " + mensagemRecebida);
+                System.out.println("DEBUG: Mensagem recebida de " + enderecoCliente.getHostAddress() + ":" + portaCliente + " -> " + mensagemRecebida);
 
-                // Vamos processar a mensagem aqui.
-                // Por enquanto, apenas um eco simples de volta para o cliente.
-                // Depois, adicionaremos a lógica do jogo.
+                // Variável para armazenar o jogador atual que enviou a mensagem.
+                Jogador jogadorAtual = null;
+                // Procura o jogador no mapa de jogadores conectados usando IP e Porta.
+                // Esta é a forma mais robusta de identificar um cliente UDP.
+                for (Jogador j : jogadoresConectados.values()) {
+                    if (j.ip.equals(enderecoCliente) && j.porta == portaCliente) {
+                        jogadorAtual = j;
+                        break;
+                    }
+                }
 
-                // A lógica aqui será mais complexa, tratando o estado do jogo e dos jogadores.
-                // Por exemplo, a primeira mensagem pode ser um "cadastro de nickname"
-                // ou uma escolha de menu (1, 2, 3).
+                // --- Lógica para processar a mensagem recebida ---
 
-                // Se for uma mensagem de cadastro de nickname
-                if (!jogadoresConectados.containsKey(mensagemRecebida) && jogadoresConectados.size() < N_JOGADORES_INICIAIS) {
-                    try {
-                        semaforoCadastro.acquire(); // Tenta pegar uma "vaga" para o jogador
+                if (jogadorAtual == null) { // Se o jogador não foi encontrado, é um novo cliente ou um desconhecido.
+                    // Tenta cadastrar um novo jogador.
+                    // Condições: Não é vazio, não é nickname duplicado, e há vagas no jogo.
+                    if (!mensagemRecebida.isEmpty() && !jogadoresConectados.containsKey(mensagemRecebida) && semaforoCadastro.tryAcquire()) {
                         Jogador novoJogador = new Jogador(mensagemRecebida, enderecoCliente, portaCliente);
-                        jogadoresConectados.put(novoJogador.nickname, novoJogador); // Adiciona o jogador à lista
-                        System.out.println("Jogador(a): " + novoJogador.nickname + " entrou no jogo. IP:" + novoJogador.ip + " Porta: " + novoJogador.porta);
+                        jogadoresConectados.put(novoJogador.nickname, novoJogador); // Adiciona o novo jogador ao mapa
+                        System.out.println("Jogador(a): " + novoJogador.nickname + " entrou no jogo. IP:" + novoJogador.ip.getHostAddress() + " Porta: " + novoJogador.porta);
 
-                        // Envia mensagem de boas-vindas e menu
+                        // Envia a mensagem de boas-vindas e o menu inicial.
                         String boasVindas = "Bem-vindo(a), " + novoJogador.nickname + ".\n" +
                                             "Digite 1 - para ver as regras do jogo.\n" +
                                             "Digite 2 - para iniciar o jogo.\n" +
@@ -117,112 +155,145 @@ public class JuizUDP {
                                             "O que deseja:";
                         novoJogador.enviarMensagem(serverSocket, boasVindas);
 
-                        // Se atingimos o número de jogadores para iniciar o jogo
+                        // Se o número de jogadores conectados atingiu o limite inicial, inicia a partida.
                         if (jogadoresConectados.size() == N_JOGADORES_INICIAIS) {
                             System.out.println("DEBUG: " + N_JOGADORES_INICIAIS + " jogadores conectados. Iniciando a barreira...");
-                            configurarBarreira(); // Configura a barreira para a rodada inicial
-                            // Envia "Que comecem os jogos..." para todos os jogadores
+                            configurarBarreira(); // Configura a barreira para a primeira rodada.
+                            // Envia mensagem de início para todos os jogadores.
                             for (Jogador j : jogadoresConectados.values()) {
                                 j.enviarMensagem(serverSocket, "Jogadores oponentes encontrados. Que comecem os jogos...");
+                                // Manda a primeira instrução para o jogador escolher um número.
+                                j.enviarMensagem(serverSocket, "Escolha um número entre 0 e 100:");
                             }
                         } else {
-                            // Envia status de espera para o novo jogador
-                             novoJogador.enviarMensagem(serverSocket, "Aguardando jogadores oponentes... (" + jogadoresConectados.size() + "/" + N_JOGADORES_INICIAIS + " conectados)");
+                            // Se ainda não há jogadores suficientes, informa ao novo jogador.
+                            novoJogador.enviarMensagem(serverSocket, "Aguardando jogadores oponentes... (" + jogadoresConectados.size() + "/" + N_JOGADORES_INICIAIS + " conectados)");
                         }
-
-                    } catch (InterruptedException e) {
-                        System.err.println("Erro ao adquirir semáforo: " + e.getMessage());
-                        semaforoCadastro.release(); // Libera se algo der errado no acquire
+                    } else {
+                        // Se não conseguiu se cadastrar (jogo cheio, nickname duplicado ou mensagem inválida para cadastro).
+                        String msgCheio = "Jogo está cheio, nickname já usado ou entrada inválida. Tente novamente mais tarde.";
+                        byte[] dadosMsg = msgCheio.getBytes(); // Correção: msgCheio (não msgCheho)
+                        DatagramPacket pacoteErro = new DatagramPacket(dadosMsg, dadosMsg.length, enderecoCliente, portaCliente);
+                        serverSocket.send(pacoteErro);
                     }
-                } else {
-                    // Se não for um novo cadastro, é uma interação de um jogador existente
-                    Jogador jogadorAtual = jogadoresConectados.get(enderecoCliente.getHostAddress() + ":" + portaCliente);
-                    if (jogadorAtual == null) {
-                         // Tenta encontrar pelo nickname se não encontrar pelo IP/Porta (menos ideal para UDP, mas pode ocorrer no fluxo inicial)
-                         // Para este exemplo, vamos considerar que o nickname é único para simplificar a busca
-                         // Em um sistema real, seria melhor usar IP+Porta como chave ou um ID único do jogador
-                         // Para os testes iniciais, o nickname servirá.
-                        boolean found = false;
-                        for (Jogador j : jogadoresConectados.values()) {
-                            if (j.ip.equals(enderecoCliente) && j.porta == portaCliente) {
-                                jogadorAtual = j;
-                                found = true;
-                                break;
-                            }
-                        }
-                        if (!found) {
-                            System.out.println("DEBUG: Mensagem de um cliente desconhecido: " + mensagemRecebida);
-                            String resposta = "Desculpe, seu nickname não foi reconhecido ou o jogo já começou.";
-                            byte[] dadosResposta = resposta.getBytes();
-                            DatagramPacket pacoteResposta = new DatagramPacket(dadosResposta, dadosResposta.length, enderecoCliente, portaCliente);
-                            serverSocket.send(pacoteResposta);
-                            continue; // Ignora o resto do loop para esta mensagem
-                        }
-                    }
-
-                    // Processar as escolhas do menu (1, 2, 3) ou o número do jogo
+                } else { // Se a mensagem veio de um jogador já cadastrado (jogadorAtual não é null).
                     try {
-                        int escolha = Integer.parseInt(mensagemRecebida);
+                        int escolha = Integer.parseInt(mensagemRecebida); // Tenta converter a mensagem para um número.
+                        String mensagemParaJogador = ""; // Variável para a mensagem de resposta ao jogador.
+
                         switch (escolha) {
-                            case 1: // Ver regras
-                                // ... código das regras ...
-                                // Após mostrar as regras, reenvia o menu
-                                String menuMessage = "Bem-vindo(a)," + jogadorAtual.nickname + ".\n" +
+                            case 1: // Jogador escolheu para ver as regras.
+                                String regras = "==\nRegras do Jogo da Sobrevivência Numérica:\n" +
+                                                "==\n" +
+                                                "No início três jogadores jogam, escolhendo um número entre 0 e 100.\n" +
+                                                "O Servidor do jogo receberá os três números escolhidos e calculará a média dos valores recebidos.\n" +
+                                                "O resultado das médias é então multiplicado por 0,8.\n" +
+                                                "Este novo valor resultante será o valor alvo.\n" +
+                                                "O valor alvo é comparado com os valores que cada jogador escolheu.\n" +
+                                                "O jogador que mais se distanciou do valor alvo, perde dois pontos.\n" +
+                                                "O jogador que mais se aproximou do valor alvo, não perde pontos.\n" +
+                                                "O outro jogador perde apenas um ponto.\n" +
+                                                "O jogador que chegar a menos seis pontos, primeiro, será eliminado definitivamente do jogo.\n" +
+                                                "Quando restarem apenas dois jogadores, as regras do jogo mudam.\n" +
+                                                "O jogador que mais se distanciar do valor alvo, perde um ponto.\n" +
+                                                "O outro jogador, não perde pontos.\n" +
+                                                "O jogador que primeiro chegar a menos seis pontos, será eliminado do jogo.\n" +
+                                                "O último jogador é declarado vencedor do Jogo da Sobrevivência Numérica.\n" +
+                                                "================================================================================";
+                                jogadorAtual.enviarMensagem(serverSocket, regras);
+                                // Após mostrar as regras, reenvia o menu principal.
+                                mensagemParaJogador = "Bem-vindo(a)," + jogadorAtual.nickname + ".\n" +
                                                      "Digite 1 - para ver as regras do jogo.\n" +
                                                      "Digite 2 - para iniciar o jogo.\n" +
                                                      "Digite 3 - para sair do jogo.\n" +
                                                      "O que deseja:";
-                                jogadorAtual.enviarMensagem(serverSocket, menuMessage);
+                                jogadorAtual.enviarMensagem(serverSocket, mensagemParaJogador);
                                 break;
-                            // ... outros cases ...
-                            default: // Tenta interpretar como um número para o jogo
-                                // ... código ...
-                                // Reenvia o menu se a entrada for inválida e não for um número de jogo
-                                // REMOVA 'String' AQUI
-                                menuMessage = "Bem-vindo(a)," + jogadorAtual.nickname + ".\n" + // AQUI não tem mais 'String'
-                                             "Digite 1 - para ver as regras do jogo.\n" +
-                                             "Digite 2 - para iniciar o jogo.\n" +
-                                             "Digite 3 - para sair do jogo.\n" +
-                                             "O que deseja:";
-                                jogadorAtual.enviarMensagem(serverSocket, menuMessage);
-                                break;
-                            default: // Tenta interpretar como um número para o jogo
-                                if (jogadoresConectados.size() >= N_JOGADORES_INICIAIS && escolha >= 0 && escolha <= 100) {
-                                    jogadorAtual.valorEscolhido = escolha;
-                                    System.out.println("Jogador(a) " + jogadorAtual.nickname + " escolheu o número: " + jogadorAtual.valorEscolhido);
-                                    jogadorAtual.enviarMensagem(serverSocket, "Você escolheu o número: " + escolha + ".\nEnviando o número escolhido para o servidor do jogo...\nAguardando os outros jogadores..."); 
 
-                                    // Tenta alcançar a barreira. Se todos chegarem, a barreira é quebrada e a rodada processada.
-                                    // Importante: A barreira precisa ser resetada ou configurada para cada rodada
-                                    try {
-                                        barreiraRodada.await(); // Espera todos os jogadores chegarem aqui
-                                    } catch (Exception e) { // BrokenBarrierException, InterruptedException
-                                        System.err.println("DEBUG: Erro na barreira ou barreira quebrada antes da hora: " + e.getMessage());
-                                        // O servidor pode enviar uma mensagem de erro ou tentar reiniciar a rodada
-                                        jogadorAtual.enviarMensagem(serverSocket, "Ocorreu um erro na rodada. Tente novamente.");
+                            case 2: // Jogador escolheu para iniciar o jogo ou continuar.
+                                if (jogadoresConectados.size() < N_JOGADORES_INICIAIS) {
+                                    mensagemParaJogador = "Aguardando mais jogadores para iniciar o jogo. (" + jogadoresConectados.size() + "/" + N_JOGADORES_INICIAIS + " conectados)";
+                                    jogadorAtual.enviarMensagem(serverSocket, mensagemParaJogador);
+                                } else {
+                                    // Se o jogo já tem jogadores suficientes, presume que a opção 2 é para "começar a jogar" ou "escolher um número".
+                                    mensagemParaJogador = "Que comecem os jogos...\nEscolha um número entre 0 e 100:";
+                                    jogadorAtual.enviarMensagem(serverSocket, mensagemParaJogador);
+                                }
+                                break;
+
+                            case 3: // Jogador escolheu sair do jogo.
+                                jogadoresConectados.remove(jogadorAtual.nickname); // Remove o jogador do mapa.
+                                semaforoCadastro.release(); // Libera uma vaga no semáforo.
+                                System.out.println("Jogador(a): " + jogadorAtual.nickname + " saiu do jogo.");
+                                mensagemParaJogador = "Você escolheu sair do jogo. Até mais!";
+                                jogadorAtual.enviarMensagem(serverSocket, mensagemParaJogador);
+                                // Se todos os jogadores saíram, o servidor se "reinicia" para uma nova partida.
+                                if (jogadoresConectados.isEmpty()) {
+                                    semaforoCadastro = new Semaphore(N_JOGADORES_INICIAIS); // Reinicia o semáforo.
+                                    barreiraRodada = null; // Zera a barreira.
+                                    System.out.println("Todos os jogadores saíram. Servidor pronto para nova partida.");
+                                }
+                                break;
+
+                            default: // Para qualquer outro número, tentamos interpretar como uma jogada.
+                                if (escolha >= 0 && escolha <= 100) { // Verifica se é um número entre 0 e 100.
+                                    // Verifica se o jogo já tem jogadores suficientes para uma rodada.
+                                    if (jogadoresConectados.size() >= N_JOGADORES_INICIAIS) {
+                                        jogadorAtual.valorEscolhido = escolha; // Armazena o número escolhido pelo jogador.
+                                        System.out.println("Jogador(a) " + jogadorAtual.nickname + " escolheu o número: " + jogadorAtual.valorEscolhido);
+                                        mensagemParaJogador = "Você escolheu o número: " + escolha + ".\nEnviando o número escolhido para o servidor do jogo...\nAguardando os outros jogadores...";
+                                        jogadorAtual.enviarMensagem(serverSocket, mensagemParaJogador);
+
+                                        // Tenta fazer o jogador "chegar" na barreira.
+                                        try {
+                                            if (barreiraRodada != null) { // Garante que a barreira foi inicializada e não é null.
+                                                barreiraRodada.await(); // Espera até que todos os jogadores ativos cheguem aqui.
+                                            } else {
+                                                // Se a barreira não foi inicializada, o jogo não está na fase de jogadas.
+                                                mensagemParaJogador = "O jogo ainda não começou oficialmente. Aguarde outros jogadores.";
+                                                jogadorAtual.enviarMensagem(serverSocket, mensagemParaJogador);
+                                            }
+                                        } catch (BrokenBarrierException | InterruptedException e) {
+                                            System.err.println("DEBUG: Erro na barreira ou barreira quebrada antes da hora: " + e.getMessage());
+                                            mensagemParaJogador = "Ocorreu um erro na rodada. Tente novamente.";
+                                            jogadorAtual.enviarMensagem(serverSocket, mensagemParaJogador);
+                                        }
+                                    } else {
+                                        // Não há jogadores suficientes para iniciar a rodada com jogadas.
+                                        mensagemParaJogador = "Aguardando mais jogadores para iniciar o jogo. (" + jogadoresConectados.size() + "/" + N_JOGADORES_INICIAIS + " conectados)";
+                                        jogadorAtual.enviarMensagem(serverSocket, mensagemParaJogador);
+                                        // Reenvia o menu.
+                                        mensagemParaJogador = "Bem-vindo(a)," + jogadorAtual.nickname + ".\n" +
+                                                             "Digite 1 - para ver as regras do jogo.\n" +
+                                                             "Digite 2 - para iniciar o jogo.\n" +
+                                                             "Digite 3 - para sair do jogo.\n" +
+                                                             "O que deseja:";
+                                        jogadorAtual.enviarMensagem(serverSocket, mensagemParaJogador);
                                     }
 
-                                } else {
-                                    jogadorAtual.enviarMensagem(serverSocket, "Entrada inválida ou jogo não iniciado. Digite um número de 0 a 100 ou escolha uma opção do menu.");
-                                    // Reenvia o menu se a entrada for inválida e não for um número de jogo
-                                    String menuMessage = "Bem-vindo(a)," + jogadorAtual.nickname + ".\n" +
+                                } else { // Entrada inválida (não é uma opção de menu e nem um número de jogo válido).
+                                    mensagemParaJogador = "Entrada inválida. Digite um número de 0 a 100 ou escolha uma opção do menu.";
+                                    jogadorAtual.enviarMensagem(serverSocket, mensagemParaJogador);
+                                    // Reenvia o menu.
+                                    mensagemParaJogador = "Bem-vindo(a)," + jogadorAtual.nickname + ".\n" +
                                                          "Digite 1 - para ver as regras do jogo.\n" +
                                                          "Digite 2 - para iniciar o jogo.\n" +
                                                          "Digite 3 - para sair do jogo.\n" +
-                                                         "O que deseja:"; 
-                                    jogadorAtual.enviarMensagem(serverSocket, menuMessage);
+                                                         "O que deseja:";
+                                    jogadorAtual.enviarMensagem(serverSocket, mensagemParaJogador);
                                 }
                                 break;
                         }
-                    } catch (NumberFormatException e) {
-                        jogadorAtual.enviarMensagem(serverSocket, "Entrada inválida. Digite um número para a opção do menu ou para sua jogada.");
-                        // Reenvia o menu se a entrada não for um número
-                        String menuMessage = "Bem-vindo(a)," + jogadorAtual.nickname + ".\n" +
+                    } catch (NumberFormatException e) { // Se a mensagem não puder ser convertida para número.
+                        String mensagemParaJogador = "Entrada inválida. Digite um número para a opção do menu ou para sua jogada.";
+                        jogadorAtual.enviarMensagem(serverSocket, mensagemParaJogador);
+                        // Reenvia o menu.
+                        mensagemParaJogador = "Bem-vindo(a)," + jogadorAtual.nickname + ".\n" +
                                              "Digite 1 - para ver as regras do jogo.\n" +
                                              "Digite 2 - para iniciar o jogo.\n" +
                                              "Digite 3 - para sair do jogo.\n" +
                                              "O que deseja:";
-                        jogadorAtual.enviarMensagem(serverSocket, menuMessage);
+                        jogadorAtual.enviarMensagem(serverSocket, mensagemParaJogador);
                     }
                 }
             }
@@ -232,55 +303,54 @@ public class JuizUDP {
         } catch (IOException e) {
             System.err.println("Erro de I/O no servidor: " + e.getMessage());
         } finally {
+            // Garante que o socket do servidor seja fechado quando o programa terminar ou ocorrer um erro.
+            // O 'serverSocket' agora está declarado fora do try, então é acessível aqui.
             if (serverSocket != null && !serverSocket.isClosed()) {
                 serverSocket.close();
             }
         }
     }
 
-    // Adaptação do processarRodada do código TCP
-    public static synchronized void processarRodada() throws IOException {
+    // Método que contém toda a lógica para processar uma rodada do jogo.
+    // Recebe o DatagramSocket do servidor para poder enviar mensagens de placar e status.
+    public static synchronized void processarRodada(DatagramSocket serverSocket) throws IOException {
         System.out.println("DEBUG: Iniciando processamento da rodada.");
 
-        // Verificar se ainda há jogadores ativos (evita erro se um jogador saiu logo após a barreira)
-        if (jogadoresConectados.isEmpty()) {
-            System.out.println("DEBUG: Não há jogadores para processar a rodada.");
-            return;
-        }
-
-        // Criar uma lista temporária dos jogadores ativos para a rodada
+        // Cria uma cópia da lista de jogadores ativos para evitar ConcurrentModificationException
+        // e trabalhar com uma lista estática durante o cálculo da rodada.
         List<Jogador> jogadoresAtivos = new ArrayList<>(jogadoresConectados.values());
 
-        // Se houver menos de 3 jogadores e a barreira for quebrada, é um problema de sincronização
-        if (jogadoresAtivos.size() < 2) { // Precisa de pelo menos 2 para as regras de 2 jogadores
+        // Se houver menos de 2 jogadores, o jogo não pode continuar e é encerrado.
+        if (jogadoresAtivos.size() < 2) {
              System.out.println("DEBUG: Número insuficiente de jogadores para continuar o jogo. Jogo encerrado.");
-             for(Jogador j : jogadoresAtivos){
-                 j.enviarMensagem(barreiraRodada.getParties().get(0).toString(), "Jogo encerrado devido a falta de jogadores."); // TODO: Adaptar para usar o socket
+             for(Jogador j : jogadoresAtivos){ // Envia mensagem de encerramento para os jogadores restantes.
+                 j.enviarMensagem(serverSocket, "Jogo encerrado devido a falta de jogadores.");
              }
-             // Resetar o estado do jogo para nova partida
+             // Reinicia o estado do jogo para uma nova partida.
              jogadoresConectados.clear();
              semaforoCadastro = new Semaphore(N_JOGADORES_INICIAIS);
-             barreiraRodada = null;
-             return;
+             barreiraRodada = null; // Barreira zerada, será configurada novamente na próxima partida.
+             return; // Sai do método, pois o jogo terminou.
         }
-
 
         double soma = 0;
-        // Calcula a soma dos valores escolhidos pelos jogadores ativos na rodada
+        int numJogadoresComNumero = 0; // Conta quantos jogadores realmente escolheram um número válido.
+        // Calcula a soma dos valores escolhidos pelos jogadores que participaram da rodada.
         for (Jogador jogador : jogadoresAtivos) {
-            if (jogador.valorEscolhido != -1) { // Só soma se o jogador realmente escolheu um número
+            if (jogador.valorEscolhido != -1) { // Só soma se o jogador realmente escolheu um número.
                 soma += jogador.valorEscolhido;
+                numJogadoresComNumero++;
             }
         }
 
-        // Evita divisão por zero se por algum motivo nenhum jogador escolheu um número válido
-        if (jogadoresAtivos.stream().noneMatch(j -> j.valorEscolhido != -1)) {
+        // Evita divisão por zero se, por algum motivo, nenhum jogador escolheu um número válido na rodada.
+        if (numJogadoresComNumero == 0) {
             System.out.println("DEBUG: Nenhum jogador escolheu um número válido nesta rodada. Pulando cálculo.");
              for (Jogador jogador : jogadoresAtivos) {
-                jogador.enviarMensagem(barreiraRodada.getParties().get(0).toString(), "Nenhum número válido escolhido na rodada. Placar permanece o mesmo."); // TODO: Adaptar para usar o socket
-                jogador.enviarMensagem(barreiraRodada.getParties().get(0).toString(), "Seu placar é: " + jogador.pontuacao); // TODO: Adaptar para usar o socket
+                jogador.enviarMensagem(serverSocket, "Nenhum número válido escolhido na rodada. Placar permanece o mesmo.");
+                jogador.enviarMensagem(serverSocket, "Seu placar é: " + jogador.pontuacao);
             }
-            // Resetar valores escolhidos para próxima rodada e configurar barreira novamente
+            // Reseta os valores escolhidos para a próxima rodada e reconfigura a barreira.
             for (Jogador jogador : jogadoresAtivos) {
                 jogador.valorEscolhido = -1;
             }
@@ -288,75 +358,88 @@ public class JuizUDP {
             return;
         }
 
-        double media = soma / jogadoresAtivos.stream().filter(j -> j.valorEscolhido != -1).count();
-        double valorAlvo = media * 0.8;
+        double media = soma / numJogadoresComNumero; // Calcula a média.
+        double valorAlvo = media * 0.8;             // Calcula o valor alvo.
 
         System.out.println("DEBUG: Média: " + media + ", Valor Alvo: " + valorAlvo);
 
-        // Ordena os jogadores pela distância ao valor alvo (do mais próximo ao mais distante) 
-        jogadoresAtivos.sort(Comparator.comparingDouble(j -> Math.abs(j.valorEscolhido - valorAlvo)));
+        // Cria uma lista apenas com os jogadores que de fato participaram desta rodada (escolheram um número).
+        // Isso é importante para aplicar a pontuação corretamente.
+        List<Jogador> jogadoresParaPontuar = new ArrayList<>();
+        for (Jogador j : jogadoresAtivos) {
+            if (j.valorEscolhido != -1) {
+                jogadoresParaPontuar.add(j);
+            }
+        }
+        // Ordena esses jogadores pela distância ao valor alvo (do mais próximo ao mais distante).
+        // A função Math.abs() garante que a distância seja sempre positiva.
+        jogadoresParaPontuar.sort(Comparator.comparingDouble(j -> Math.abs(j.valorEscolhido - valorAlvo)));
 
-        // Aplica a pontuação
-        // As regras mudam se restarem apenas 2 jogadores
-        if (jogadoresAtivos.size() == 3) {
-            // O mais próximo não perde pontos  (já está na primeira posição por causa da ordenação)
-            jogadoresAtivos.get(0).pontuacao += 0; // Para clareza, não muda
-            // O do meio perde 1 ponto 
-            jogadoresAtivos.get(1).pontuacao--;
-            // O mais distante perde 2 pontos 
-            jogadoresAtivos.get(2).pontuacao -= 2;
-        } else if (jogadoresAtivos.size() == 2) {
-            // O mais próximo não perde pontos 
-            jogadoresAtivos.get(0).pontuacao += 0; // Para clareza, não muda
-            // O mais distante perde 1 ponto 
-            jogadoresAtivos.get(1).pontuacao--;
+
+        // Aplica a pontuação conforme as regras do jogo.
+        // As regras mudam dependendo do número de jogadores na partida.
+        if (jogadoresParaPontuar.size() == 3) {
+            // Com 3 jogadores:
+            // O mais próximo (índice 0) não perde pontos.
+            jogadoresParaPontuar.get(0).pontuacao += 0; // Para clareza, não muda
+            // O do meio (índice 1) perde 1 ponto.
+            jogadoresParaPontuar.get(1).pontuacao--;
+            // O mais distante (índice 2) perde 2 pontos.
+            jogadoresParaPontuar.get(2).pontuacao -= 2;
+        } else if (jogadoresParaPontuar.size() == 2) {
+            // Com 2 jogadores:
+            // O mais próximo (índice 0) não perde pontos.
+            jogadoresParaPontuar.get(0).pontuacao += 0; // Para clareza, não muda
+            // O mais distante (índice 1) perde 1 ponto.
+            jogadoresParaPontuar.get(1).pontuacao--;
         }
 
-        // Envia os placares atualizados para todos os jogadores ativos e verifica eliminações
-        List<String> jogadoresEliminados = new ArrayList<>();
+        // Lista para armazenar os nicknames dos jogadores que serão eliminados.
+        List<String> nicknamesEliminados = new ArrayList<>();
+        // Envia os placares atualizados para TODOS os jogadores que estavam ativos na rodada (mesmo os que não pontuaram).
         for (Jogador jogador : jogadoresAtivos) {
-            jogador.enviarMensagem(barreiraRodada.getParties().get(0).toString(), "Seu placar é: " + jogador.pontuacao); // TODO: Adaptar para usar o socket
+            jogador.enviarMensagem(serverSocket, "Seu placar é: " + jogador.pontuacao);
             System.out.println("DEBUG: Placar de " + jogador.nickname + ": " + jogador.pontuacao);
 
-            // Verifica se o jogador foi eliminado 
+            // Verifica se o jogador foi eliminado (atingiu -6 pontos ou menos).
             if (jogador.pontuacao <= -6) {
-                jogador.enviarMensagem(barreiraRodada.getParties().get(0).toString(), "Você foi eliminado(a)!"); // TODO: Adaptar para usar o socket 
-                jogadoresEliminados.add(jogador.nickname);
+                jogador.enviarMensagem(serverSocket, "Você foi eliminado(a)!");
+                nicknamesEliminados.add(jogador.nickname); // Adiciona à lista de eliminados.
                 System.out.println("DEBUG: Jogador(a) " + jogador.nickname + " foi eliminado.");
             }
-            // Resetar o valor escolhido para a próxima rodada
+            // Reseta o valor escolhido do jogador para a próxima rodada.
             jogador.valorEscolhido = -1;
         }
 
-        // Remove os jogadores eliminados do mapa principal
-        for (String nickname : jogadoresEliminados) {
+        // Remove os jogadores eliminados do mapa principal de jogadores conectados.
+        for (String nickname : nicknamesEliminados) {
             jogadoresConectados.remove(nickname);
-            semaforoCadastro.release(); // Libera uma vaga
+            semaforoCadastro.release(); // Libera uma vaga no semáforo para futuros jogadores.
         }
 
-        // Verifica se há um vencedor 
-        if (jogadoresConectados.size() == 1) {
-            Jogador vencedor = jogadoresConectados.values().iterator().next();
-            vencedor.enviarMensagem(barreiraRodada.getParties().get(0).toString(), "Parabéns! Você foi o(a) vencedor(a)!"); // TODO: Adaptar para usar o socket 
+        // --- Verificação de Vencedor ou Fim de Jogo ---
+        if (jogadoresConectados.size() == 1) { // Se sobrou apenas um jogador, ele é o vencedor.
+            Jogador vencedor = jogadoresConectados.values().iterator().next(); // Pega o único jogador restante.
+            vencedor.enviarMensagem(serverSocket, "Parabéns! Você foi o(a) vencedor(a)!");
             System.out.println("DEBUG: Jogador(a) " + vencedor.nickname + " venceu o jogo!");
 
-            // Limpa todos os jogadores e reinicia o semáforo para uma nova partida
+            // Limpa o estado do jogo para uma nova partida.
             jogadoresConectados.clear();
-            semaforoCadastro = new Semaphore(N_JOGADORES_INICIAIS);
-            barreiraRodada = null; // A barreira será configurada novamente quando 3 jogadores se conectarem
+            semaforoCadastro = new Semaphore(N_JOGADORES_INICIAIS); // Reinicia o semáforo.
+            barreiraRodada = null; // A barreira será configurada novamente quando 3 novos jogadores se conectarem.
             System.out.println("DEBUG: Fim de jogo. Servidor pronto para nova partida.");
-        } else if (jogadoresConectados.size() == 0) {
+        } else if (jogadoresConectados.size() == 0) { // Se todos os jogadores foram eliminados.
             System.out.println("DEBUG: Todos os jogadores foram eliminados. Fim de jogo.");
+            // Reinicia o estado do jogo.
             semaforoCadastro = new Semaphore(N_JOGADORES_INICIAIS);
             barreiraRodada = null;
             System.out.println("DEBUG: Fim de jogo. Servidor pronto para nova partida.");
-        }
-         else {
-            // Se o jogo continua, configura a barreira para a próxima rodada com os jogadores restantes
+        } else {
+            // Se o jogo continua (ainda há 2 ou mais jogadores), configura a barreira para a próxima rodada.
             configurarBarreira();
-            // Envia mensagem para os jogadores restantes escolherem um novo número
+            // Envia mensagem para os jogadores restantes escolherem um novo número.
             for (Jogador jogador : jogadoresConectados.values()) {
-                jogador.enviarMensagem(barreiraRodada.getParties().get(0).toString(), "Escolha um número entre 0 e 100:"); // TODO: Adaptar para usar o socket 
+                jogador.enviarMensagem(serverSocket, "Escolha um número entre 0 e 100:");
             }
         }
     }
