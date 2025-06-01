@@ -19,7 +19,6 @@ public class JogadorUDP {
 
         try {
             clientSocket = new DatagramSocket();
-            // REMOVIDO: clientSocket.setSoTimeout(5000); para evitar a mensagem de timeout.
             // O cliente agora vai esperar bloqueando por mensagens do servidor.
 
             InetAddress IPAddress = InetAddress.getByName(ENDERECO_SERVIDOR);
@@ -38,7 +37,6 @@ public class JogadorUDP {
                 String mensagemRecebida = null;
                 try {
                     mensagemRecebida = receberMensagem(clientSocket);
-                    // Não imprime a mensagem "Nenhuma mensagem..."
                     System.out.println(mensagemRecebida);
                     ultimaMensagemServidor = mensagemRecebida;
 
@@ -56,7 +54,6 @@ public class JogadorUDP {
                     }
 
                 } catch (SocketException e) {
-                    // Se houver uma exceção, não imprime o "timed out"
                     System.err.println("Conexão com o servidor perdida: " + e.getMessage());
                     jogoAtivo = false;
                     break;
@@ -65,7 +62,6 @@ public class JogadorUDP {
                 }
 
                 if (jogoAtivo && mensagemRecebida != null) {
-                    // Adicionada a lógica para pedir entrada após as mensagens específicas do servidor
                     if (ultimaMensagemServidor.contains("O que deseja:") || 
                         ultimaMensagemServidor.contains("Escolha um número entre 0 e 100:")) { 
                         
@@ -73,10 +69,8 @@ public class JogadorUDP {
                         String escolhaUsuario = scanner.nextLine();
                         enviarMensagem(clientSocket, IPAddress, PORTA_SERVIDOR, escolhaUsuario);
                     }
-                    // Adicionando um "enter" visual após o placar ou fim de rodada, se a mensagem indicar isso.
-                    // Isso é uma heurística, o ideal seria o servidor enviar um comando específico.
                     if (ultimaMensagemServidor.contains("Seu placar é:") || ultimaMensagemServidor.contains("Fim da Rodada.")) {
-                         System.out.println("\n------------------------------------\n"); // Separador visual
+                         System.out.println("\n------------------------------------\n");
                     }
                 }
             }
